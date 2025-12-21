@@ -1,1 +1,100 @@
+name: xDrip4iOS TestFlight
 
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+jobs:
+  build-and-upload:
+    runs-on: macos-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Select Xcode
+      run: sudo xcode-select -s /Applications/Xcode.app
+
+    # ---------- App Store Connect API ----------
+    - name: Create API key file
+      run: |
+        mkdir -p ~/.appstoreconnect/private_keys
+        echo "${{ secrets.APPSTORE_PRIVATE_KEY }}" > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APPSTORE_KEY_ID }}.p8
+
+    # ---------- Keychain ----------
+    - name: Setup Keychain
+      run: |
+        security create-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+        security default-keychain -s build.keychain
+        security unlock-keychain -p "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+        security set-keychain-settings -lut 21600 build.keychain
+
+    # ---------- Certificat ----------
+    - name: Import App Store Certificate
+      run: |
+        echo "${{ secrets.APPLE_CERT_BASE64 }}" | base64 --decode > dist.p12
+        security import dist.p12 \
+          -k build.keychain \
+          -P "${{ secrets.APPLE_CERT_PASSWORD }}" \
+          -T /usr/bin/codesign
+        security set-key-partition-list -S apple-tool:,apple: -s \
+          -k "${{ secrets.KEYCHAIN_PASSWORD }}" build.keychain
+
+    # ---------- Provisioning Profile ----------
+    - name: Install Provisioning Profile
+      run: |
+        mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+        echo "${{ secrets.PROVISION_PROFILE_BASE64 }}" | base64 --decode \
+          > ~/Library/MobileDevice/Provisioning\ Profiles/appstore.mobileprovision
+
+    # ---------- Dépendances ----------
+    - name: Install dependencies
+      run: |
+        sudo gem install cocoapods
+        pod install || true
+
+    # ---------- Build & Archive ----------
+    - name: Archive app
+      run: |
+        xcodebuild clean archive \
+          -workspace xDrip.xcworkspace \
+          -scheme xDrip \
+          -configuration Release \
+          -sdk iphoneos \
+          -archivePath $PWD/build/xDrip.xcarchive \
+          DEVELOPMENT_TEAM=${{ secrets.APPLE_TEAM_ID }} \
+          PRODUCT_BUNDLE_IDENTIFIER=${{ secrets.BUNDLE_ID }} \
+          CODE_SIGN_STYLE=Manual
+
+    # ---------- Export App Store IPA ----------
+    - name: Export IPA
+      run: |
+        cat <<EOF > ExportOptions.plist
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>method</key>
+          <string>app-store</string>
+          <key>signingStyle</key>
+          <string>manual</string>
+        </dict>
+        </plist>
+        EOF
+
+        xcodebuild -exportArchive \
+          -archivePath build/xDrip.xcarchive \
+          -exportOptionsPlist ExportOptions.plist \
+          -exportPath build/ipa
+
+    # ---------- Upload TestFlight ----------
+    - name: Upload to TestFlight
+      run: |
+        xcrun altool --upload-app \
+          -f build/ipa/*.ipa \
+          -t ios \
+          --apiKey ${{ secrets.APPSTORE_KEY_ID }} \
+          --apiIssuer ${{ secrets.APPSTORE_ISSUER_ID }}
